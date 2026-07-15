@@ -17,10 +17,12 @@ const CONFIG = {
   webhookUrl: process.env.DISCORD_WEBHOOK_URL || '',
   pingRoleId: process.env.PING_ROLE_ID || '',
   updateMinutes: Number(process.env.UPDATE_MINUTES || 15),
-  tokenAddress: '0x3600000000000000000000000000000000000000'.toLowerCase(),
+  tokenAddress: '0x3600000000000000000000000000000000000000',
+  tokenAddressLower: '0x3600000000000000000000000000000000000000',
   zeroAddress: '0x0000000000000000000000000000000000000000',
   explorerBase: 'https://arc-mainnet.cloud.blockscout.com',
   blockscoutBase: 'https://arc-mainnet.cloud.blockscout.com/api/v2',
+  rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.arc.io',
   stateFile: path.resolve('data/state.json')
 };
 
@@ -54,6 +56,11 @@ function loadState() {
 
 function saveState(state) {
   fs.writeFileSync(CONFIG.stateFile, JSON.stringify(state, null, 2));
+}
+
+function hexToBigInt(hex) {
+  if (!hex || hex === '0x') return 0n;
+  return BigInt(hex);
 }
 
 function formatUnits(raw, decimals = 6) {
@@ -100,8 +107,54 @@ async function jsonFetch(url) {
   return res.json();
 }
 
+async function rpcCall(method, params) {
+  const res = await fetch(CONFIG.rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method,
+      params
+    })
+  });
+
+  if (!res.ok) {
+    throw new Error(`RPC HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+
+  if (data.error) {
+    throw new Error(`RPC error: ${data.error.message || 'unknown error'}`);
+  }
+
+  return data.result;
+}
+
 async function getTokenMeta() {
-  return jsonFetch(`${CONFIG.blockscoutBase}/tokens/${CONFIG.tokenAddress}`);
+  const [decimalsHex, supplyHex] = await Promise.all([
+    rpcCall('eth_call', [
+      {
+        to: CONFIG.tokenAddress,
+        data: '0x313ce567'
+      },
+      'latest'
+    ]),
+    rpcCall('eth_call', [
+      {
+        to: CONFIG.tokenAddress,
+        data: '0x18160ddd'
+      },
+      'latest'
+    ])
+  ]);
+
+  return {
+    decimals: Number(hexToBigInt(decimalsHex)),
+    total_supply: hexToBigInt(supplyHex).toString(),
+    holders_count: 'N/A'
+  };
 }
 
 async function getLatestUsdcMints() {
@@ -109,7 +162,7 @@ async function getLatestUsdcMints() {
   const data = await jsonFetch(url);
 
   return (data.items || []).filter((item) => {
-    const tokenMatch = safeAddress(item?.token?.address_hash) === CONFIG.tokenAddress;
+    const tokenMatch = safeAddress(item?.token?.address_hash) === CONFIG.tokenAddressLower;
     const fromMatch = safeAddress(item?.from?.hash) === CONFIG.zeroAddress;
     return tokenMatch && fromMatch;
   });
@@ -134,7 +187,7 @@ function buildMintEmbed(item, supplyRaw, decimals) {
       { name: 'Total Supply', value: `${totalSupply} USDC`, inline: true },
       { name: 'Recipient', value: `\`${to}\``, inline: false }
     )
-    .setFooter({ text: 'ARC Blockscout USDC tracker' });
+    .setFooter({ text: 'ARC Blockscout + ARC RPC tracker' });
 
   if (item?.timestamp) {
     const ts = Math.floor(new Date(item.timestamp).getTime() / 1000);
@@ -262,7 +315,6 @@ client.on('interactionCreate', async (interaction) => {
 
     const token = await getTokenMeta();
     const supply = formatNumber(formatUnits(token?.total_supply || '0', Number(token?.decimals || 6)));
-    const holders = String(token?.holders_count || '0');
 
     await interaction.editReply({
       embeds: [
@@ -270,12 +322,12 @@ client.on('interactionCreate', async (interaction) => {
           .setTitle('ARC USDC Supply')
           .setColor(0x2775ca)
           .addFields(
-            { name: 'Total circulating', value: `${supply} USDC`, inline: true },
-            { name: 'Holders', value: holders, inline: true },
+            { name: 'Total supply', value: `${supply} USDC`, inline: true },
+            { name: 'Decimals', value: `${token?.decimals || 6}`, inline: true },
             { name: 'Token', value: `\`${CONFIG.tokenAddress}\``, inline: false }
           )
           .setURL(`${CONFIG.explorerBase}/token/${CONFIG.tokenAddress}`)
-          .setFooter({ text: 'Source: ARC Blockscout' })
+          .setFooter({ text: 'Source: ARC RPC + Blockscout explorer' })
           .setTimestamp(new Date())
       ]
     });
