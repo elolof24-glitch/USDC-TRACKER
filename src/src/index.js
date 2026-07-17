@@ -1,348 +1,233 @@
 import 'dotenv/config';
-import {
-  Client,
-  GatewayIntentBits,
-  SlashCommandBuilder,
-  REST,
-  Routes,
-  EmbedBuilder
-} from 'discord.js';
-import fs from 'node:fs';
-import path from 'node:path';
+import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
+import fetch from 'node-fetch';
 
-const CONFIG = {
-  discordToken: process.env.DISCORD_TOKEN,
-  clientId: process.env.DISCORD_CLIENT_ID,
-  guildId: process.env.DISCORD_GUILD_ID || '',
-  webhookUrl: process.env.DISCORD_WEBHOOK_URL || '',
-  pingRoleId: process.env.PING_ROLE_ID || '',
-  updateMinutes: Number(process.env.UPDATE_MINUTES || 15),
-  tokenAddress: '0x3600000000000000000000000000000000000000',
-  tokenAddressLower: '0x3600000000000000000000000000000000000000',
-  zeroAddress: '0x0000000000000000000000000000000000000000',
-  explorerBase: 'https://arc-mainnet.cloud.blockscout.com',
-  blockscoutBase: 'https://arc-mainnet.cloud.blockscout.com/api/v2',
-  rpcUrl: process.env.ARC_RPC_URL || 'https://rpc.arc.io',
-  stateFile: path.resolve('data/state.json')
+// ---- env ----
+const {
+  DISCORD_TOKEN,
+  DISCORD_APP_ID,
+  DISCORD_GUILD_ID,
+  RPC_URL,
+  USDC_ADDRESS,
+  ALERT_CHANNEL_ID,
+} = process.env;
+
+if (!DISCORD_TOKEN || !DISCORD_APP_ID || !RPC_URL || !USDC_ADDRESS) {
+  console.error('Missing required env vars');
+  process.exit(1);
+}
+
+// ---- basic JSON-RPC helper ----
+let rpcId = 1;
+async function rpcCall(method, params) {
+  const body = {
+    jsonrpc: '2.0',
+    id: rpcId++,
+    method,
+    params,
+  };
+
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    throw new Error(`RPC HTTP error ${res.status}`);
+  }
+
+  const json = await res.json();
+  if (json.error) {
+    throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+  }
+  return json.result;
+}
+
+// ---- ABI fragments we need ----
+// Minimal ERC20 ABI for totalSupply & decimals.
+const ERC20_ABI = {
+  totalSupply: '0x18160ddd', // keccak("totalSupply()") first 4 bytes
+  decimals: '0x313ce567',    // keccak("decimals()") first 4 bytes
 };
 
-if (!CONFIG.discordToken || !CONFIG.clientId) {
-  throw new Error('Missing DISCORD_TOKEN or DISCORD_CLIENT_ID in environment variables.');
-}
-
-fs.mkdirSync(path.dirname(CONFIG.stateFile), { recursive: true });
-
-function loadState() {
-  if (!fs.existsSync(CONFIG.stateFile)) {
-    return {
-      lastKnownSupply: null,
-      lastMintKey: null,
-      lastCheckedAt: null,
-      recentMints: []
-    };
-  }
-
-  try {
-    return JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
-  } catch {
-    return {
-      lastKnownSupply: null,
-      lastMintKey: null,
-      lastCheckedAt: null,
-      recentMints: []
-    };
-  }
-}
-
-function saveState(state) {
-  fs.writeFileSync(CONFIG.stateFile, JSON.stringify(state, null, 2));
-}
-
+// ---- helpers ----
 function hexToBigInt(hex) {
   if (!hex || hex === '0x') return 0n;
   return BigInt(hex);
 }
 
-function formatUnits(raw, decimals = 6) {
-  const value = BigInt(String(raw || '0'));
-  const base = 10n ** BigInt(decimals);
-  const whole = value / base;
-  const fraction = value % base;
-  const fractionStr = fraction.toString().padStart(decimals, '0').replace(/0+$/, '');
-  return fractionStr ? `${whole.toString()}.${fractionStr}` : whole.toString();
+function formatUnits(valueBigInt, decimals) {
+  const d = BigInt(decimals);
+  const base = 10n ** d;
+  const whole = valueBigInt / base;
+  const frac = valueBigInt % base;
+
+  if (frac === 0n) return whole.toString();
+
+  const fracStr = frac.toString().padStart(Number(d), '0').replace(/0+$/, '');
+  return `${whole.toString()}.${fracStr}`;
 }
 
-function formatNumber(str) {
-  const [whole, frac] = String(str).split('.');
-  const withCommas = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-  return frac ? `${withCommas}.${frac}` : withCommas;
+// Encode a simple ERC20 call: function selector + 32‑byte padded address (only for balanceOf).
+function encodeFunctionCall(selector, address) {
+  const addrNo0x = address.toLowerCase().replace(/^0x/, '');
+  const padded = addrNo0x.padStart(64, '0');
+  return selector + padded;
 }
 
-function safeAddress(value) {
-  return typeof value === 'string' ? value.toLowerCase() : '';
-}
-
-function getTransferAmount(item) {
-  return (
-    item?.total?.value ??
-    item?.total?.amount ??
-    item?.amount ??
-    item?.value ??
-    '0'
-  );
-}
-
-async function jsonFetch(url) {
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'arc-usdc-tracker/1.0',
-      'Accept': 'application/json'
-    }
-  });
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} for ${url}`);
-  }
-
-  return res.json();
-}
-
-async function rpcCall(method, params) {
-  const res = await fetch(CONFIG.rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method,
-      params
-    })
-  });
-
-  if (!res.ok) {
-    throw new Error(`RPC HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-
-  if (data.error) {
-    throw new Error(`RPC error: ${data.error.message || 'unknown error'}`);
-  }
-
-  return data.result;
-}
-
-async function getTokenMeta() {
-  const [decimalsHex, supplyHex] = await Promise.all([
-    rpcCall('eth_call', [
-      {
-        to: CONFIG.tokenAddress,
-        data: '0x313ce567'
-      },
-      'latest'
-    ]),
-    rpcCall('eth_call', [
-      {
-        to: CONFIG.tokenAddress,
-        data: '0x18160ddd'
-      },
-      'latest'
-    ])
+// ---- USDC reads ----
+async function getTokenDecimals() {
+  const data = ERC20_ABI.decimals;
+  const result = await rpcCall('eth_call', [
+    {
+      to: USDC_ADDRESS,
+      data,
+    },
+    'latest',
   ]);
-
-  return {
-    decimals: Number(hexToBigInt(decimalsHex)),
-    total_supply: hexToBigInt(supplyHex).toString(),
-    holders_count: 'N/A'
-  };
+  return Number(hexToBigInt(result));
 }
 
-async function getLatestUsdcMints() {
-  const url = `${CONFIG.blockscoutBase}/addresses/${CONFIG.zeroAddress}/token-transfers?type=ERC-20`;
-  const data = await jsonFetch(url);
-
-  return (data.items || []).filter((item) => {
-    const tokenMatch = safeAddress(item?.token?.address_hash) === CONFIG.tokenAddressLower;
-    const fromMatch = safeAddress(item?.from?.hash) === CONFIG.zeroAddress;
-    return tokenMatch && fromMatch;
-  });
+async function getTotalSupply() {
+  const data = ERC20_ABI.totalSupply;
+  const result = await rpcCall('eth_call', [
+    {
+      to: USDC_ADDRESS,
+      data,
+    },
+    'latest',
+  ]);
+  return hexToBigInt(result);
 }
 
-function mintKey(item) {
-  return `${item?.transaction_hash || item?.tx_hash || item?.block_hash || 'unknown'}:${item?.log_index ?? '0'}`;
-}
+// ---- mint detection via logs ----
+//
+// Standard ERC20 Transfer topic:
+// keccak256("Transfer(address,address,uint256)")
+const TRANSFER_TOPIC =
+  '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
-function buildMintEmbed(item, supplyRaw, decimals) {
-  const minted = formatNumber(formatUnits(getTransferAmount(item), decimals));
-  const totalSupply = formatNumber(formatUnits(supplyRaw, decimals));
-  const to = item?.to?.hash || 'unknown';
-  const txHash = item?.transaction_hash || item?.tx_hash || '';
-  const txUrl = txHash ? `${CONFIG.explorerBase}/tx/${txHash}` : null;
+// Zero address in topics (indexed "from").
+const ZERO_ADDRESS_TOPIC =
+  '0x0000000000000000000000000000000000000000000000000000000000000000';
 
-  const embed = new EmbedBuilder()
-    .setTitle('ARC USDC Mint Detected')
-    .setColor(0x2775ca)
-    .addFields(
-      { name: 'Minted', value: `${minted} USDC`, inline: true },
-      { name: 'Total Supply', value: `${totalSupply} USDC`, inline: true },
-      { name: 'Recipient', value: `\`${to}\``, inline: false }
-    )
-    .setFooter({ text: 'ARC Blockscout + ARC RPC tracker' });
+let lastCheckedBlock = null;
 
-  if (item?.timestamp) {
-    const ts = Math.floor(new Date(item.timestamp).getTime() / 1000);
-    if (Number.isFinite(ts)) {
-      embed.addFields({ name: 'Time', value: `<t:${ts}:R>`, inline: true });
-      embed.setTimestamp(new Date(item.timestamp));
+async function pollMints(botClient) {
+  try {
+    const latestHex = await rpcCall('eth_blockNumber', []);
+    const latestBlock = Number(hexToBigInt(latestHex));
+
+    // Initial bootstrap: just set the lastCheckedBlock and return.
+    if (lastCheckedBlock === null) {
+      lastCheckedBlock = latestBlock;
+      return;
     }
-  }
 
-  if (txUrl) {
-    embed.setURL(txUrl);
-  }
+    // If nothing new, stop.
+    if (latestBlock <= lastCheckedBlock) {
+      return;
+    }
 
-  return embed;
-}
+    // Query logs between lastCheckedBlock+1 and latestBlock
+    const fromBlock = `0x${(lastCheckedBlock + 1).toString(16)}`;
+    const toBlock = `0x${latestBlock.toString(16)}`;
 
-async function sendWebhookMessage(payload) {
-  if (!CONFIG.webhookUrl) return;
+    const logs = await rpcCall('eth_getLogs', [
+      {
+        fromBlock,
+        toBlock,
+        address: USDC_ADDRESS,
+        topics: [
+          TRANSFER_TOPIC,
+          ZERO_ADDRESS_TOPIC, // mints: from = 0x0
+        ],
+      },
+    ]);
 
-  const res = await fetch(CONFIG.webhookUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+    if (logs && logs.length > 0 && ALERT_CHANNEL_ID) {
+      const channel = botClient.channels.cache.get(ALERT_CHANNEL_ID);
+      if (channel) {
+        const decimals = await getTokenDecimals();
+        for (const log of logs) {
+          // data is the amount (uint256).
+          const amount = hexToBigInt(log.data);
+          const formatted = formatUnits(amount, decimals);
 
-  if (!res.ok) {
-    throw new Error(`Webhook failed: ${res.status}`);
-  }
-}
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-let state = loadState();
-
-async function poll() {
-  const [token, mints] = await Promise.all([getTokenMeta(), getLatestUsdcMints()]);
-  const decimals = Number(token?.decimals || 6);
-  const supplyRaw = token?.total_supply || '0';
-  const latestMint = mints[0] || null;
-
-  if (latestMint) {
-    const latestKey = mintKey(latestMint);
-
-    if (state.lastMintKey && latestKey !== state.lastMintKey) {
-      const newMints = [];
-
-      for (const item of mints) {
-        const key = mintKey(item);
-        if (key === state.lastMintKey) break;
-        newMints.push(item);
-      }
-
-      newMints.reverse();
-
-      for (const item of newMints) {
-        try {
-          const content = CONFIG.pingRoleId ? `<@&${CONFIG.pingRoleId}>` : '@here';
-          const embed = buildMintEmbed(item, supplyRaw, decimals);
-          await sendWebhookMessage({ content, embeds: [embed.toJSON()] });
-        } catch (err) {
-          console.error('Failed to send mint alert:', err);
+          const toAddr = '0x' + log.topics[2].slice(26); // last 20 bytes
+          await channel.send(
+            `New USDC mint detected: **${formatted}** to **${toAddr}** (block ${Number(
+              hexToBigInt(log.blockNumber),
+            )})`,
+          );
         }
       }
     }
 
-    state.lastMintKey = latestKey;
-    state.recentMints = mints.slice(0, 10).map((item) => ({
-      key: mintKey(item),
-      timestamp: item?.timestamp || null,
-      to: item?.to?.hash || null,
-      amount: getTransferAmount(item)
-    }));
+    lastCheckedBlock = latestBlock;
+  } catch (err) {
+    console.error('pollMints error:', err.message);
   }
-
-  state.lastKnownSupply = supplyRaw;
-  state.lastCheckedAt = new Date().toISOString();
-  saveState(state);
-
-  return { token, latestMint };
 }
 
-const totalCommand = new SlashCommandBuilder()
-  .setName('total')
-  .setDescription('Show current ARC-chain USDC circulating supply');
+// ---- Discord setup ----
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+});
+
+const commands = [
+  {
+    name: 'total',
+    description: 'Show total USDC supply on MegaETH',
+  },
+];
 
 async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(CONFIG.discordToken);
-  const body = [totalCommand.toJSON()];
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
-  if (CONFIG.guildId) {
+  if (DISCORD_GUILD_ID) {
     await rest.put(
-      Routes.applicationGuildCommands(CONFIG.clientId, CONFIG.guildId),
-      { body }
+      Routes.applicationGuildCommands(DISCORD_APP_ID, DISCORD_GUILD_ID),
+      { body: commands },
     );
+    console.log('Registered guild slash commands');
   } else {
-    await rest.put(
-      Routes.applicationCommands(CONFIG.clientId),
-      { body }
-    );
+    await rest.put(Routes.applicationCommands(DISCORD_APP_ID), {
+      body: commands,
+    });
+    console.log('Registered global slash commands');
   }
 }
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  await registerCommands();
 
-  try {
-    await registerCommands();
-    console.log('Slash commands registered.');
-  } catch (err) {
-    console.error('Command registration failed:', err);
-  }
-
-  await poll().catch((err) => console.error('Initial poll failed:', err));
-
-  setInterval(() => {
-    poll().catch((err) => console.error('Poll failed:', err));
-  }, CONFIG.updateMinutes * 60 * 1000);
+  // Start mint polling every 5 seconds.
+  setInterval(() => pollMints(client), 5000);
 });
 
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== 'total') return;
 
-  try {
+  if (interaction.commandName === 'total') {
     await interaction.deferReply();
 
-    const token = await getTokenMeta();
-    const supply = formatNumber(formatUnits(token?.total_supply || '0', Number(token?.decimals || 6)));
-
-    await interaction.editReply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle('ARC USDC Supply')
-          .setColor(0x2775ca)
-          .addFields(
-            { name: 'Total supply', value: `${supply} USDC`, inline: true },
-            { name: 'Decimals', value: `${token?.decimals || 6}`, inline: true },
-            { name: 'Token', value: `\`${CONFIG.tokenAddress}\``, inline: false }
-          )
-          .setURL(`${CONFIG.explorerBase}/token/${CONFIG.tokenAddress}`)
-          .setFooter({ text: 'Source: ARC RPC + Blockscout explorer' })
-          .setTimestamp(new Date())
-      ]
-    });
-  } catch (error) {
-    console.error('Slash command failed:', error);
-
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply({ content: `Failed to fetch supply: ${error.message}` }).catch(() => {});
-    } else {
-      await interaction.reply({ content: `Failed to fetch supply: ${error.message}`, ephemeral: true }).catch(() => {});
+    try {
+      const [decimals, totalBn] = await Promise.all([
+        getTokenDecimals(),
+        getTotalSupply(),
+      ]);
+      const formatted = formatUnits(totalBn, decimals);
+      await interaction.editReply(
+        `Current USDC total supply on MegaETH: **${formatted}**`,
+      );
+    } catch (err) {
+      console.error('total command error:', err.message);
+      await interaction.editReply('Error fetching total supply from RPC.');
     }
   }
 });
 
-client.login(CONFIG.discordToken).catch((err) => {
-  console.error('Discord login failed:', err);
-  process.exit(1);
-});
+client.login(DISCORD_TOKEN);
